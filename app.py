@@ -45,37 +45,72 @@ def _file_bytes(field='file'):
 
 # ── PDF lane ────────────────────────────────────────────────────────────────
 
+BULLET_RE = re.compile(r'^\s*(?:[•▪◦–\-\*]|\d{1,2}[.)])\s')
+# a bullet glyph alone on its line (PyMuPDF often splits '• text' into two
+# lines) — folded into the NEXT line so list rows keep their original height
+BULLET_ONLY_RE = re.compile(r'^\s*[•▪◦–\-\*]\s*$')
+
+
+def _font_class(name):
+    n = (name or '').lower()
+    if 'mono' in n or 'courier' in n or 'consol' in n:
+        return 'mono'
+    if 'times' in n or 'serif' in n or 'georgia' in n or 'garamond' in n or 'book' in n:
+        return 'serif'
+    return 'sans'
+
+
 def pdf_collect(doc):
-    """The document's OWN text blocks -> paragraph-merged jobs (no heuristics
-    beyond joining adjacent same-style blocks). Union rect, bold flag, color."""
+    """The document's OWN text blocks -> paragraph-merged jobs. Line-aware:
+    lines join with newlines (bullet lists survive translation as lines — live
+    12/7: space-joins turned lists into one clump). Dominant font family rides
+    along so the rebuild can match sans/serif/mono. Bullet blocks never merge."""
     jobs = []
     for pno, page in enumerate(doc):
         raw = []
         for b in page.get_text('dict')['blocks']:
             if b.get('type') != 0:
                 continue
-            spans = [s for l in b.get('lines', []) for s in l.get('spans', [])]
-            text = ' '.join(s['text'] for s in spans).strip()
-            if not text:
+            lines = []
+            fonts = []
+            for l in b.get('lines', []):
+                spans = l.get('spans', [])
+                lt = ' '.join(s['text'] for s in spans).strip()
+                if lt:
+                    lines.append(lt)
+                fonts.extend(s.get('font', '') for s in spans)
+            if not lines:
                 continue
+            folded = []
+            for lt in lines:
+                if folded and BULLET_ONLY_RE.match(folded[-1]):
+                    folded[-1] = folded[-1].strip() + ' ' + lt
+                else:
+                    folded.append(lt)
+            lines = folded
+            spans = [s for l in b.get('lines', []) for s in l.get('spans', [])]
+            dom_font = max(set(fonts), key=fonts.count) if fonts else ''
             raw.append({
-                'page': pno, 'rect': fitz.Rect(b['bbox']), 'text': text,
+                'page': pno, 'rect': fitz.Rect(b['bbox']), 'text': '\n'.join(lines),
                 'size': max(s['size'] for s in spans),
                 'color': max(set(s['color'] for s in spans),
                              key=[s['color'] for s in spans].count),
                 'bold': any('bold' in s.get('font', '').lower() for s in spans),
+                'font': _font_class(dom_font),
             })
         raw.sort(key=lambda j: (j['rect'].y0, j['rect'].x0))
         merged = []
         for j in raw:
             m = merged[-1] if merged else None
-            if m and m['page'] == j['page']:
+            is_bullet = bool(BULLET_RE.match(j['text']))
+            if m and m['page'] == j['page'] and not is_bullet:
                 vgap = j['rect'].y0 - m['rect'].y1
                 xover = min(m['rect'].x1, j['rect'].x1) - max(m['rect'].x0, j['rect'].x0)
-                same_style = m['bold'] == j['bold'] and abs(m['size'] - j['size']) < 0.6
+                same_style = (m['bold'] == j['bold'] and abs(m['size'] - j['size']) < 0.6
+                              and m['font'] == j['font'])
                 if vgap < 0.9 * j['size'] and xover > 0 and same_style:
                     m['rect'] |= j['rect']
-                    m['text'] += ' ' + j['text']
+                    m['text'] += '\n' + j['text']
                     continue
             merged.append(dict(j))
         jobs.extend(merged)
@@ -139,10 +174,13 @@ def pdf_build():
                        .replace('>', '&gt;').replace('\n', '<br>'))
             color = '#%06x' % j['color']
             size = max(MIN_FONT, j['size'])
+            fam = {'serif': 'Times, serif', 'mono': 'Courier, monospace'}.get(
+                j.get('font', 'sans'), 'Helvetica, Arial, sans-serif')
+            base = 'font-size:%.1fpx;color:%s;font-family:%s' % (size, color, fam)
             if j['bold']:
-                html = '<b style="font-size:%.1fpx;color:%s">%s</b>' % (size, color, esc)
+                html = '<b style="%s">%s</b>' % (base, esc)
             else:
-                html = '<span style="font-size:%.1fpx;color:%s">%s</span>' % (size, color, esc)
+                html = '<span style="%s">%s</span>' % (base, esc)
             rect = fitz.Rect(j['rect'].x0, j['rect'].y0 - 0.15 * j['size'],
                              j['rect'].x1 + 0.35 * j['rect'].width,
                              j['rect'].y1 + 0.45 * j['size'])
