@@ -218,15 +218,19 @@ def pdf_build():
                              j['rect'].x1 + 0.35 * j['rect'].width,
                              max(j['rect'].y1 + 0.45 * j['size'], j['_grow_bottom']))
             rect.x1 = min(rect.x1, page.rect.width - 8)
-            # scale_low: auto-shrink down to the 8pt-equivalent floor, never below
-            low = min(1.0, MIN_FONT / size)
-            spare, scale = page.insert_htmlbox(rect, html, scale_low=low)
-            if spare < 0:
-                report['failed'] += 1  # fail-don't-clip: htmlbox keeps content visible
-            elif scale < 1:
-                report['shrunk'] += 1
-            else:
+            # NEVER-VANISH (Morten 12/7 "text just disappears"): scale_low is a
+            # low floor so insert_htmlbox picks the LARGEST scale in [low,1] that
+            # fits. Normal content renders at 1.0; only genuinely-oversized text
+            # shrinks — and it is ALWAYS drawn (tiny beats a blank spot). A single
+            # call, so there is never a double-drawn overlay.
+            floor = min(1.0, MIN_FONT / size)          # the "quality" 8pt floor
+            spare, scale = page.insert_htmlbox(rect, html, scale_low=0.05)
+            if scale >= 0.999:
                 report['placed'] += 1
+            elif scale >= floor - 0.001:
+                report['shrunk'] += 1                  # readable shrink
+            else:
+                report['failed'] += 1                  # drawn, but below the 8pt floor
     if only_idx is not None:
         doc.select([only_idx])
     out = io.BytesIO(doc.tobytes())
