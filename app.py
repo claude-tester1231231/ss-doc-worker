@@ -117,25 +117,30 @@ def pdf_build():
         page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE)
         for j in pj:
             text = tr[j['id']]
-            rgb = ((j['color'] >> 16 & 255) / 255, (j['color'] >> 8 & 255) / 255,
-                   (j['color'] & 255) / 255)
-            font = 'hebo' if j['bold'] else 'helv'
+            # insert_htmlbox: full Unicode (Cyrillic/Arabic/CJK, shaping, RTL) —
+            # Base14 'helv' turned every non-Latin char into '?' (live 12/7).
+            # The replacement text is DATA: escape it, never interpret as HTML.
+            esc = (text.replace('&', '&amp;').replace('<', '&lt;')
+                       .replace('>', '&gt;').replace('\n', '<br>'))
+            color = '#%06x' % j['color']
+            size = max(MIN_FONT, j['size'])
+            if j['bold']:
+                html = '<b style="font-size:%.1fpx;color:%s">%s</b>' % (size, color, esc)
+            else:
+                html = '<span style="font-size:%.1fpx;color:%s">%s</span>' % (size, color, esc)
             rect = fitz.Rect(j['rect'].x0, j['rect'].y0 - 0.15 * j['size'],
                              j['rect'].x1 + 0.35 * j['rect'].width,
                              j['rect'].y1 + 0.45 * j['size'])
             rect.x1 = min(rect.x1, page.rect.width - 8)
-            placed = False
-            fs = j['size']
-            while fs >= MIN_FONT:
-                if page.insert_textbox(rect, text, fontsize=fs, fontname=font, color=rgb) >= 0:
-                    placed = True
-                    report['placed' if fs == j['size'] else 'shrunk'] += 1
-                    break
-                fs -= 0.5
-            if not placed:
-                # fail-don't-clip: keep original-size box even if it overflows
-                page.insert_textbox(rect, text, fontsize=MIN_FONT, fontname=font, color=rgb)
-                report['failed'] += 1
+            # scale_low: auto-shrink down to the 8pt-equivalent floor, never below
+            low = min(1.0, MIN_FONT / size)
+            spare, scale = page.insert_htmlbox(rect, html, scale_low=low)
+            if spare < 0:
+                report['failed'] += 1  # fail-don't-clip: htmlbox keeps content visible
+            elif scale < 1:
+                report['shrunk'] += 1
+            else:
+                report['placed'] += 1
     out = io.BytesIO(doc.tobytes())
     resp = send_file(out, mimetype='application/pdf', as_attachment=True,
                      download_name='translated.pdf')
