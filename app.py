@@ -89,9 +89,10 @@ def pdf_extract():
     _auth()
     doc = fitz.open(stream=_file_bytes(), filetype='pdf')
     jobs = pdf_collect(doc)
+    # 'page' (1-based) rides along so callers can pipeline per page (lazy view)
     return jsonify({
         'engine': 'pdf', 'pages': len(doc),
-        'blocks': [{'id': j['id'], 'text': j['text']} for j in jobs],
+        'blocks': [{'id': j['id'], 'text': j['text'], 'page': j['page'] + 1} for j in jobs],
     })
 
 
@@ -103,12 +104,26 @@ def pdf_build():
         abort(400, 'missing translations')
     doc = fitz.open(stream=_file_bytes(), filetype='pdf')
     jobs = pdf_collect(doc)
-    # hard 1:1 contract: every block must have a non-empty replacement
+    # optional page scope (1-based): build ONLY that page and return a 1-page
+    # PDF — the lazy per-page pipeline. Ids stay the global b<N> ids.
+    only = request.form.get('page')
+    only_idx = None
+    if only is not None and str(only).strip() != '':
+        try:
+            only_idx = int(only) - 1
+        except ValueError:
+            abort(400, 'bad page')
+        if only_idx < 0 or only_idx >= len(doc):
+            abort(400, 'bad page')
+        jobs = [j for j in jobs if j['page'] == only_idx]
+    # hard 1:1 contract: every block IN SCOPE must have a non-empty replacement
     missing = [j['id'] for j in jobs if not isinstance(tr.get(j['id']), str) or not tr[j['id']].strip()]
     if missing:
         abort(422, 'missing ids: ' + ','.join(missing[:20]))
     report = {'blocks': len(jobs), 'placed': 0, 'shrunk': 0, 'failed': 0}
     for page in doc:
+        if only_idx is not None and page.number != only_idx:
+            continue
         pj = [j for j in jobs if j['page'] == page.number]
         if not pj:
             continue
@@ -141,6 +156,8 @@ def pdf_build():
                 report['shrunk'] += 1
             else:
                 report['placed'] += 1
+    if only_idx is not None:
+        doc.select([only_idx])
     out = io.BytesIO(doc.tobytes())
     resp = send_file(out, mimetype='application/pdf', as_attachment=True,
                      download_name='translated.pdf')
