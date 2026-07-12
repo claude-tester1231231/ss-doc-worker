@@ -71,16 +71,29 @@ def pdf_collect(doc):
         for b in page.get_text('dict')['blocks']:
             if b.get('type') != 0:
                 continue
-            lines = []
+            # collect (y, text) per line-object; PyMuPDF emits side-by-side text
+            # (form label + value) as SEPARATE line-objects at the SAME y —
+            # joining those with \n forces 2x height into a 1-line box (live 12/7
+            # tight_boxes bug). Group by vertical position: same row -> space,
+            # real vertical gap -> newline.
             fonts = []
+            rows = []  # [ (y0, height, text) ]
             for l in b.get('lines', []):
                 spans = l.get('spans', [])
                 lt = ' '.join(s['text'] for s in spans).strip()
-                if lt:
-                    lines.append(lt)
                 fonts.extend(s.get('font', '') for s in spans)
-            if not lines:
+                if not lt:
+                    continue
+                lb = l.get('bbox', b['bbox'])
+                ly, lh = lb[1], max(1.0, lb[3] - lb[1])
+                if rows and abs(ly - rows[-1][0]) < 0.6 * rows[-1][1]:
+                    rows[-1] = (rows[-1][0], rows[-1][1], rows[-1][2] + ' ' + lt)
+                else:
+                    rows.append((ly, lh, lt))
+            if not rows:
                 continue
+            rows.sort(key=lambda r: r[0])
+            lines = [r[2] for r in rows]
             folded = []
             for lt in lines:
                 if folded and BULLET_ONLY_RE.match(folded[-1]):
@@ -162,6 +175,23 @@ def pdf_build():
         pj = [j for j in jobs if j['page'] == page.number]
         if not pj:
             continue
+        # HEADROOM (hardening 12/7): a longer translation must flow DOWN into the
+        # empty space below its block instead of overflowing its original height.
+        # For each block, find the nearest block below it that horizontally
+        # overlaps; the insert box may grow to just above that (or the bottom
+        # margin). Short text stays put (htmlbox is top-aligned); long text uses
+        # the whitespace the source left. Column-aware via the x-overlap test, so
+        # a sidebar block never grows into a main-column block.
+        bottom_margin = page.rect.height - 30
+        for j in pj:
+            limit = bottom_margin
+            for k in pj:
+                if k is j or k['rect'].y0 < j['rect'].y1 - 1:
+                    continue
+                xov = min(j['rect'].x1, k['rect'].x1) - max(j['rect'].x0, k['rect'].x0)
+                if xov > 1 and k['rect'].y0 < limit:
+                    limit = k['rect'].y0
+            j['_grow_bottom'] = max(j['rect'].y1, limit - 2)
         for j in pj:
             page.add_redact_annot(j['rect'])
         page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE)
@@ -176,14 +206,17 @@ def pdf_build():
             size = max(MIN_FONT, j['size'])
             fam = {'serif': 'Times, serif', 'mono': 'Courier, monospace'}.get(
                 j.get('font', 'sans'), 'Helvetica, Arial, sans-serif')
-            base = 'font-size:%.1fpx;color:%s;font-family:%s' % (size, color, fam)
+            # word-break: long compounds (German "Kraftfahrzeug…") must wrap
+            # instead of overflowing the box horizontally.
+            base = ('font-size:%.1fpx;color:%s;font-family:%s;'
+                    'overflow-wrap:anywhere;word-break:break-word' % (size, color, fam))
             if j['bold']:
                 html = '<b style="%s">%s</b>' % (base, esc)
             else:
                 html = '<span style="%s">%s</span>' % (base, esc)
             rect = fitz.Rect(j['rect'].x0, j['rect'].y0 - 0.15 * j['size'],
                              j['rect'].x1 + 0.35 * j['rect'].width,
-                             j['rect'].y1 + 0.45 * j['size'])
+                             max(j['rect'].y1 + 0.45 * j['size'], j['_grow_bottom']))
             rect.x1 = min(rect.x1, page.rect.width - 8)
             # scale_low: auto-shrink down to the 8pt-equivalent floor, never below
             low = min(1.0, MIN_FONT / size)
