@@ -144,6 +144,28 @@ def pdf_extract():
     })
 
 
+def _actualtext_wrap(doc, page, pre_xrefs, text):
+    """ToUnicode-armor (13/7, live-batteri-fund): MuPDF's htmlbox mapper
+    kontekst-substituerede glyffer FORKERT i ToUnicode — thai stablede
+    tonemærker blev '2'/'1' (นี้->นี2), arabiske lam-alef-ligaturer blev
+    garbage (hvert «al-»-ord), latin fi/ff blev ligatur-kodepunkter. Glyfferne
+    TEGNES korrekt; kun kopiér/markér/oplæs var ødelagt. Fix: hver bloks
+    nyindsatte content-stream pakkes i marked-content med /ActualText =
+    den logiske oversættelses-streng — spec-tro ekstraktorer (MuPDF, pdf.js,
+    Acrobat) returnerer strengen verbatim, uafhængigt af glyf-mapping.
+    8 trailing spaces absorberer rest-glyffer (glyfantal > tegnantal ved
+    variant-marks); overskud kollapser som whitespace i ekstraktion."""
+    at = '<FEFF' + (text + ' ' * 8).encode('utf-16-be').hex().upper() + '>'
+    for x in page.get_contents():
+        if x in pre_xrefs:
+            continue
+        raw = doc.xref_stream(x)
+        doc.update_stream(
+            x,
+            b'/Span <</ActualText ' + at.encode('ascii') + b'>> BDC\n'
+            + raw + b'\nEMC\n')
+
+
 @app.post('/v1/pdf/build')
 def pdf_build():
     _auth()
@@ -224,7 +246,9 @@ def pdf_build():
             # shrinks — and it is ALWAYS drawn (tiny beats a blank spot). A single
             # call, so there is never a double-drawn overlay.
             floor = min(1.0, MIN_FONT / size)          # the "quality" 8pt floor
+            pre_xrefs = set(page.get_contents())
             spare, scale = page.insert_htmlbox(rect, html, scale_low=0.05)
+            _actualtext_wrap(doc, page, pre_xrefs, text)
             if scale >= 0.999:
                 report['placed'] += 1
             elif scale >= floor - 0.001:
