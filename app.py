@@ -177,7 +177,9 @@ def _ocr_jobs(doc, raw):
         blocks = json.loads(raw)
     except ValueError:
         abort(400, 'bad ocr_blocks')
-    if not isinstance(blocks, list) or not blocks or len(blocks) > 800:
+    # loft = ekstraktorens lovlige max (24 sider x 150 paragraffer) — r1-h1:
+    # 800 kunne afvise FULD-bygget af et taet dokument efter vellykket OCR
+    if not isinstance(blocks, list) or not blocks or len(blocks) > 3600:
         abort(400, 'bad ocr_blocks')
     jobs = []
     for b in blocks:
