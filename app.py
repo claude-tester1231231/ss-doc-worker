@@ -166,6 +166,48 @@ def _actualtext_wrap(doc, page, pre_xrefs, text):
             + raw + b'\nEMC\n')
 
 
+def _ocr_jobs(doc, raw):
+    """OCR-lanen (13/7): scannede sider har ingen tekst-objekter — klienten
+    sender Vision-paragraffer som normaliserede bokse [{id,page(1-based),
+    x,y,w,h}] (0-1 af sidens rekt). Vi bygger jobs i pdf_collects form, så
+    resten af build-loopet (headroom, htmlbox, ActualText, rapport) er ETT
+    fælles spor. Redaktioner springes over af kalderen: kildeteksten er
+    PIXELS — den dækkes i stedet med en hvid plade pr. blok (whiteout)."""
+    try:
+        blocks = json.loads(raw)
+    except ValueError:
+        abort(400, 'bad ocr_blocks')
+    if not isinstance(blocks, list) or not blocks or len(blocks) > 800:
+        abort(400, 'bad ocr_blocks')
+    jobs = []
+    for b in blocks:
+        if not isinstance(b, dict) or not isinstance(b.get('id'), str):
+            abort(400, 'bad ocr_blocks')
+        try:
+            pno = int(b['page']) - 1
+            x, y, w, h = float(b['x']), float(b['y']), float(b['w']), float(b['h'])
+        except (KeyError, TypeError, ValueError):
+            abort(400, 'bad ocr_blocks')
+        if pno < 0 or pno >= len(doc):
+            abort(400, 'bad ocr_blocks')
+        if not (0 <= x <= 1 and 0 <= y <= 1 and 0 < w <= 1 and 0 < h <= 1):
+            abort(400, 'bad ocr_blocks')
+        pr = doc[pno].rect
+        rect = fitz.Rect(pr.x0 + x * pr.width, pr.y0 + y * pr.height,
+                         pr.x0 + min(x + w, 1.0) * pr.width,
+                         pr.y0 + min(y + h, 1.0) * pr.height)
+        # skriftstørrelse fra boks-højden: OCR kender ingen fonte. En Vision-
+        # paragraf kan være flerlinjet — antag linjehøjde ~1.35 og afled fra
+        # ordboksenes typiske højde er ikke tilgængelig her, så clamp bredt;
+        # htmlbox skalerer selv NED hvis oversættelsen er længere.
+        lines = max(1, round(rect.height / max(10.0, rect.width * 0.06)))
+        size = max(7.0, min(22.0, (rect.height / lines) * 0.72))
+        jobs.append({'id': b['id'], 'page': pno, 'rect': rect, 'text': '',
+                     'size': size, 'color': 0, 'bold': False, 'font': 'sans',
+                     '_ocr': True})
+    return jobs
+
+
 @app.post('/v1/pdf/build')
 def pdf_build():
     _auth()
@@ -173,7 +215,9 @@ def pdf_build():
     if not isinstance(tr, dict) or not tr:
         abort(400, 'missing translations')
     doc = fitz.open(stream=_file_bytes(), filetype='pdf')
-    jobs = pdf_collect(doc)
+    ocr_raw = request.form.get('ocr_blocks')
+    ocr_mode = ocr_raw is not None and str(ocr_raw).strip() != ''
+    jobs = _ocr_jobs(doc, ocr_raw) if ocr_mode else pdf_collect(doc)
     # optional page scope (1-based): build ONLY that page and return a 1-page
     # PDF — the lazy per-page pipeline. Ids stay the global b<N> ids.
     only = request.form.get('page')
@@ -214,9 +258,18 @@ def pdf_build():
                 if xov > 1 and k['rect'].y0 < limit:
                     limit = k['rect'].y0
             j['_grow_bottom'] = max(j['rect'].y1, limit - 2)
-        for j in pj:
-            page.add_redact_annot(j['rect'])
-        page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE)
+        if ocr_mode:
+            # scannet side: kildeteksten er pixels — redaktion kan intet
+            # fjerne. Hvid plade pr. blok (let padding) dækker originalen,
+            # oversættelsen tegnes ovenpå. Standard OCR-replace-udseende.
+            for j in pj:
+                r = j['rect']
+                pad = fitz.Rect(r.x0 - 1.5, r.y0 - 1.5, r.x1 + 1.5, r.y1 + 1.5)
+                page.draw_rect(pad, color=None, fill=(1, 1, 1))
+        else:
+            for j in pj:
+                page.add_redact_annot(j['rect'])
+            page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE)
         for j in pj:
             text = tr[j['id']]
             # insert_htmlbox: full Unicode (Cyrillic/Arabic/CJK, shaping, RTL) —
@@ -236,9 +289,18 @@ def pdf_build():
                 html = '<b style="%s">%s</b>' % (base, esc)
             else:
                 html = '<span style="%s">%s</span>' % (base, esc)
-            rect = fitz.Rect(j['rect'].x0, j['rect'].y0 - 0.15 * j['size'],
-                             j['rect'].x1 + 0.35 * j['rect'].width,
-                             max(j['rect'].y1 + 0.45 * j['size'], j['_grow_bottom']))
+            if j.get('_ocr'):
+                # OCR: boksen ER den visuelle sandhed på en scannet side —
+                # x-vækst ville tegne hen over nabospaltens PIXELS (ingen
+                # whiteout dér). Kun nedad-vækst (grow_bottom er kolonne-
+                # bevidst); htmlbox skalerer ned hvis det stadig er trangt.
+                rect = fitz.Rect(j['rect'].x0, j['rect'].y0,
+                                 j['rect'].x1 + 2,
+                                 max(j['rect'].y1, j['_grow_bottom']))
+            else:
+                rect = fitz.Rect(j['rect'].x0, j['rect'].y0 - 0.15 * j['size'],
+                                 j['rect'].x1 + 0.35 * j['rect'].width,
+                                 max(j['rect'].y1 + 0.45 * j['size'], j['_grow_bottom']))
             rect.x1 = min(rect.x1, page.rect.width - 8)
             # NEVER-VANISH (Morten 12/7 "text just disappears"): scale_low is a
             # low floor so insert_htmlbox picks the LARGEST scale in [low,1] that
